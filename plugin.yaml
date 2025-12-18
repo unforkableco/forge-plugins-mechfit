@@ -1,0 +1,116 @@
+plugin:
+  name: "Mechanical Motion & Fit"
+  slug: "mechfit"
+  author: "Fabrikator Team"
+  description: |
+    Adds mechanical reasoning to the CAD agent, enabling validation of moving parts, collision checking, and fit tolerance.
+  tags:
+    - engineering
+    - validation
+    - physics
+    - kinematics
+  iconUrl: "https://fabrikator.ai/icons/mech-gear.png"
+
+requirements:
+  environment:
+    - name: FABRIKATOR_API_URL
+      description: URL for the Fabrikator API to fetch artifacts
+      required: false
+      fallback: "http://host.docker.internal:3000"
+
+capabilities:
+  dataAccess:
+    artifacts: true
+    sessionState: true
+
+  executionDefaults:
+    type: docker
+    config:
+      image: ghcr.io/unforkableco/forge-plugins-mechfit:latest
+      port: 8080
+
+  prompts:
+    agents:
+      - agent: "cad"
+        position: "append"
+        priority: 70
+        content: |
+          ## MECHANICAL VALIDATION
+          You have access to mechanical validation tools. Use them to ensure your mechanisms work.
+          
+          ### Workflow: Anchor-Based Assembly
+          1. **Define Anchors**: For each part, define key features (holes, mounts) using `define_anchor` in LOCAL coordinates.
+             - Example: `define_anchor(part="lid", origin=[0,10,0], z_axis=[1,0,0])` for a hinge axis.
+          2. **Assemble**: Connect parts by linking their anchors using `define_joint`.
+             - Example: `define_joint(parent_part="box", parent_anchor="hinge", child_part="lid", child_anchor="hinge")`.
+          3. **Verify**: Run `motion_sweep_check` to simulate movement and check for collisions.
+
+          ### Visual Verification
+          **CRITICAL**: "Blind" coordinate math is error-prone.
+          - Every `define_anchor` call returns a debug image showing the coordinate frame.
+          - **Blue Arrow** = Z-Axis (Primary/Hinge Axis).
+          - **Red Arrow** = X-Axis (Orientation).
+          - **Workflow**: Look at the image. If the Blue Arrow points the wrong way, correct your `z_axis` vector.
+
+  tools:
+    - name: "define_anchor"
+      description: "Define a coordinate frame (Anchor) on a specific part."
+      parameters:
+        type: object
+        properties:
+          part: {type: string}
+          anchor_id: {type: string}
+          origin: {type: array, items: {type: number}, description: "[x,y,z] position in local part space"}
+          z_axis: {type: array, items: {type: number}, description: "Primary axis (e.g. hinge axis)"}
+          x_axis: {type: array, items: {type: number}, description: "Secondary axis (orientation)"}
+        required: ["part", "anchor_id", "origin", "z_axis", "x_axis"]
+      execution:
+        config:
+          endpoint: "/tools/define_anchor"
+
+    - name: "define_joint"
+      description: "Connect two parts via their anchors."
+      parameters:
+        type: object
+        properties:
+          joint_id: {type: string}
+          type: {type: string, enum: ["revolute", "prismatic", "fixed"]}
+          parent_part: {type: string}
+          parent_anchor: {type: string}
+          child_part: {type: string}
+          child_anchor: {type: string}
+          limits: {type: array, items: {type: number}, description: "[min, max] motion limits"}
+        required: ["joint_id", "type", "parent_part", "parent_anchor", "child_part", "child_anchor"]
+      execution:
+        config:
+          endpoint: "/tools/define_joint"
+
+    - name: "motion_sweep_check"
+      description: "Check for collisions by sweeping a joint through its range."
+      parameters:
+        type: object
+        properties:
+          assembly: {type: string, description: "Not used in anchor mode, leave empty or 'assembly'"}
+          joints: {type: array, items: {type: string}}
+          step_deg: {type: number, default: 5.0}
+        required: ["joints"]
+      execution:
+        config:
+          endpoint: "/tools/motion_sweep_check"
+
+    - name: "insertion_path_check"
+      description: "Check if a part can be inserted along a linear path."
+      parameters:
+        type: object
+        properties:
+          part: {type: string}
+          assembly: {type: string}
+          direction: {type: array, items: {type: number}}
+          distance: {type: number}
+        required: ["part", "assembly", "direction", "distance"]
+      execution:
+        config:
+          endpoint: "/tools/insertion_path_check"
+
+pricing:
+  model: free

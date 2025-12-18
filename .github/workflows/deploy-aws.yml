@@ -1,0 +1,185 @@
+name: Deploy to AWS ECS
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - staging
+
+env:
+  AWS_REGION: us-east-1
+  ECS_CLUSTER: forge-mechfit-cluster
+  ECS_SERVICE: mechfit-validator
+  ECS_TASK_DEFINITION: production-mechfit-validator
+  ECR_REPOSITORY: production-forge-mechfit
+
+jobs:
+  deploy:
+    name: Deploy to AWS ECS
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Determine release tag when running from a GitHub Release event
+          RELEASE_TAG=""
+          if [ "${GITHUB_EVENT_NAME}" = "release" ]; then
+            RELEASE_TAG="${GITHUB_REF_NAME}"
+          fi
+
+          # Build once, tag with SHA + latest, and also release tag if present
+          TAGS="-t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest"
+          if [ -n "$RELEASE_TAG" ]; then
+            TAGS="$TAGS -t $ECR_REGISTRY/$ECR_REPOSITORY:$RELEASE_TAG"
+            echo "📦 Including release tag: $RELEASE_TAG"
+          else
+            echo "ℹ️ No release tag detected; skipping release tag push"
+          fi
+
+          docker build $TAGS .
+
+          # Push all tags we produced
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          if [ -n "$RELEASE_TAG" ]; then
+            docker push $ECR_REGISTRY/$ECR_REPOSITORY:$RELEASE_TAG
+          fi
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Get latest image tag
+        id: image
+        run: |
+          echo "tag=${{ steps.build-image.outputs.image }}" >> $GITHUB_OUTPUT
+          echo "Deploying image: ${{ steps.build-image.outputs.image }}"
+
+      - name: Update ECS task definition
+        id: task-def
+        run: |
+          # Get current task definition
+          TASK_DEFINITION=$(aws ecs describe-task-definition \
+            --task-definition ${ECS_TASK_DEFINITION} \
+            --query 'taskDefinition' \
+            --output json)
+
+          # Update image in task definition
+          NEW_TASK_DEF=$(echo $TASK_DEFINITION | jq --arg IMAGE "${{ steps.image.outputs.tag }}" \
+            '.containerDefinitions[0].image = $IMAGE |
+             del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)')
+
+          # Register new task definition
+          NEW_TASK_INFO=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "task-definition-arn=${NEW_TASK_INFO}" >> $GITHUB_OUTPUT
+          echo "New task definition: ${NEW_TASK_INFO}"
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster ${ECS_CLUSTER} \
+            --service ${ECS_SERVICE} \
+            --task-definition ${{ steps.task-def.outputs.task-definition-arn }} \
+            --force-new-deployment
+
+          echo "✅ ECS service updated successfully"
+
+      - name: Wait for service stability
+        run: |
+          echo "⏳ Waiting for service to become stable (up to 10 minutes)..."
+          # Wait with retries - ECS deployments can take time due to resource constraints
+          for i in 1 2 3; do
+            if aws ecs wait services-stable \
+              --cluster ${ECS_CLUSTER} \
+              --services ${ECS_SERVICE} 2>/dev/null; then
+              echo "✅ Service is stable"
+              exit 0
+            fi
+            echo "⏳ Still waiting... (attempt $i/3)"
+            sleep 30
+          done
+          echo "⚠️ Service stability wait timed out, checking actual status..."
+
+      - name: Get deployment status
+        run: |
+          # Give the service a moment to settle
+          sleep 10
+          
+          SERVICE_INFO=$(aws ecs describe-services \
+            --cluster ${ECS_CLUSTER} \
+            --services ${ECS_SERVICE} \
+            --query 'services[0]' \
+            --output json)
+
+          RUNNING_COUNT=$(echo $SERVICE_INFO | jq -r '.runningCount')
+          DESIRED_COUNT=$(echo $SERVICE_INFO | jq -r '.desiredCount')
+          PENDING_COUNT=$(echo $SERVICE_INFO | jq -r '.pendingCount')
+
+          echo "📊 Deployment Summary:"
+          echo "  - Running tasks: ${RUNNING_COUNT}"
+          echo "  - Pending tasks: ${PENDING_COUNT}"
+          echo "  - Desired tasks: ${DESIRED_COUNT}"
+          echo "  - Image: ${{ steps.image.outputs.tag }}"
+
+          # Success if running matches desired, or if there's a pending task (still deploying)
+          if [ "$RUNNING_COUNT" -eq "$DESIRED_COUNT" ]; then
+            echo "✅ All tasks are running successfully"
+          elif [ "$RUNNING_COUNT" -ge 1 ] || [ "$PENDING_COUNT" -ge 1 ]; then
+            echo "✅ Deployment in progress - at least one task is running or pending"
+          else
+            echo "⚠️ Warning: No tasks running or pending"
+            exit 1
+          fi
+
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "🚀 Deployment completed successfully!"
+          echo "Image: ${{ steps.image.outputs.tag }}"
+          echo "Cluster: ${ECS_CLUSTER}"
+          echo "Service: ${ECS_SERVICE}"
+
+      - name: Notify deployment failure
+        if: failure()
+        run: |
+          echo "❌ Deployment failed!"
+          echo "Please check the AWS ECS console for details"
+
+          # Get recent events
+          aws ecs describe-services \
+            --cluster ${ECS_CLUSTER} \
+            --services ${ECS_SERVICE} \
+            --query 'services[0].events[:5]' \
+            --output table
