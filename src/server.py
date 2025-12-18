@@ -43,7 +43,7 @@ class DefineJointRequest(BaseModel):
     args: DefineJointParams
     
 class MotionSweepParams(BaseModel):
-    assembly: str
+    assembly: Optional[str] = None
     joints: List[str]
     step_deg: Optional[float] = 5.0
     step_mm: Optional[float] = 1.0
