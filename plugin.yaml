@@ -52,6 +52,8 @@ capabilities:
           - **Red Arrow** = X-Axis (Orientation).
           - **Workflow**: Look at the image. If the Blue Arrow points the wrong way, correct your `z_axis` vector.
 
+          You MUST use this tool to make sure your mechanism works. Do not skip this step.
+
   tools:
     - name: "define_anchor"
       description: "Define a coordinate frame (Anchor) on a specific part."
